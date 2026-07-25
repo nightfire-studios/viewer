@@ -2,15 +2,232 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>Wilberforce Program — PDF Viewer</title>
 <style>
-  html, body { margin:0; padding:0; height:100%; background:#525659; }
-  embed { width:100%; height:100vh; border:none; display:block; }
+  :root { --bar: 48px; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; padding:0; height:100%; background:#525659; color:#fff;
+               font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+               -webkit-text-size-adjust: 100%; }
+
+  #bar { position: fixed; top:0; left:0; right:0; height: var(--bar); z-index: 10;
+         display:flex; align-items:center; gap:8px; padding:0 10px;
+         background:#323639; border-bottom:1px solid #1e2124;
+         padding-top: env(safe-area-inset-top); height: calc(var(--bar) + env(safe-area-inset-top)); }
+  #bar .title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:.9; }
+  #bar button, #bar a.btn {
+    appearance:none; border:1px solid #55595c; background:#3f4245; color:#fff;
+    border-radius:6px; min-width:34px; height:32px; padding:0 9px; font-size:15px;
+    display:inline-flex; align-items:center; justify-content:center; text-decoration:none;
+    cursor:pointer; -webkit-tap-highlight-color: transparent; }
+  #bar button:active, #bar a.btn:active { background:#4d5154; }
+  #pageInfo { min-width:64px; text-align:center; font-variant-numeric: tabular-nums; opacity:.9; }
+
+  /* Zoomed pages are wider than the screen. The sideways scrolling has to happen
+     *inside* this container: letting the document itself overflow horizontally
+     expands the mobile layout viewport and drags the fixed toolbar off-screen. */
+  #viewer { padding: calc(var(--bar) + env(safe-area-inset-top) + 12px) 0
+            calc(24px + env(safe-area-inset-bottom));
+            overflow-x: auto; overscroll-behavior-x: contain; }
+  .page { position: relative; margin: 0 auto 12px; background:#fff;
+          box-shadow: 0 1px 6px rgba(0,0,0,.4); }
+  .page canvas { display:block; width:100%; height:100%; }
+  .page .num { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+               color:#9aa0a6; font-size:13px; pointer-events:none; }
+  .page.rendered .num { display:none; }
+
+  #status { position:fixed; inset:0; display:flex; align-items:center; justify-content:center;
+            flex-direction:column; gap:10px; text-align:center; padding:24px; }
+  #status.hidden { display:none; }
+  #track { width:min(280px, 70vw); height:4px; border-radius:2px; background:#6b6f72; overflow:hidden; }
+  #fill { height:100%; width:0%; background:#8ab4f8; transition:width .15s ease; }
+  #status a { color:#8ab4f8; }
 </style>
 </head>
 <body>
-  <embed src="./Wiberforce program.pdf" type="application/pdf" />
-   <!-- <h1>Hello world</h1> -->
+
+<div id="bar">
+  <div class="title">Wilberforce Program</div>
+  <div id="pageInfo">— / —</div>
+  <button id="zoomOut" aria-label="Zoom out">−</button>
+  <button id="zoomIn" aria-label="Zoom in">+</button>
+  <a class="btn" id="dl" href="./Wiberforce%20program.pdf" download aria-label="Download">↓</a>
+</div>
+
+<div id="viewer" hidden></div>
+
+<div id="status">
+  <div id="msg">Loading document…</div>
+  <div id="track"><div id="fill"></div></div>
+</div>
+
+<script type="module">
+import * as pdfjsLib from 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc =
+  'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.10.38/pdf.worker.min.mjs';
+
+const FILE = './Wiberforce%20program.pdf';
+const viewer   = document.getElementById('viewer');
+const statusEl = document.getElementById('status');
+const msgEl    = document.getElementById('msg');
+const fillEl   = document.getElementById('fill');
+const pageInfo = document.getElementById('pageInfo');
+
+// Cap backing-store resolution so a 16 MB booklet doesn't exhaust mobile memory.
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+// How many pages keep their pixels around outside the viewport.
+const KEEP = 2;
+
+let pdf, zoom = 1, baseWidth = 0, pages = [], renderTasks = new Map();
+
+function containerWidth() {
+  return Math.min(document.documentElement.clientWidth - 16, 1100);
+}
+
+/* Lay out every page as a correctly-proportioned placeholder first, so scrolling
+   and the page counter work before any pixels are painted. */
+function layout() {
+  const target = containerWidth() * zoom;
+  for (const p of pages) {
+    const w = target;
+    const h = Math.round(w * p.ratio);
+    p.el.style.width  = w + 'px';
+    p.el.style.height = h + 'px';
+    if (p.cssWidth && Math.abs(p.cssWidth - w) > 1) invalidate(p); // needs a re-render at the new size
+  }
+}
+
+function invalidate(p) {
+  renderTasks.get(p.num)?.cancel();
+  renderTasks.delete(p.num);
+  p.canvas?.remove();
+  p.canvas = null;
+  p.cssWidth = 0;
+  p.el.classList.remove('rendered');
+}
+
+async function render(p) {
+  const wanted = Math.round(containerWidth() * zoom);
+  if (p.cssWidth === wanted || renderTasks.has(p.num)) return;
+
+  const page = await pdf.getPage(p.num);
+  const unit = page.getViewport({ scale: 1 });
+  p.ratio = unit.height / unit.width;
+  p.el.style.height = Math.round(wanted * p.ratio) + 'px';
+
+  const viewport = page.getViewport({ scale: (wanted / unit.width) * DPR });
+  const canvas = document.createElement('canvas');
+  canvas.width  = Math.floor(viewport.width);
+  canvas.height = Math.floor(viewport.height);
+
+  const task = page.render({ canvasContext: canvas.getContext('2d', { alpha: false }), viewport });
+  renderTasks.set(p.num, task);
+  try {
+    await task.promise;
+    p.canvas?.remove();
+    p.el.appendChild(canvas);
+    p.canvas = canvas;
+    p.cssWidth = wanted;
+    p.el.classList.add('rendered');
+  } catch (e) {
+    if (e?.name !== 'RenderingCancelledException') console.error('page ' + p.num, e);
+  } finally {
+    renderTasks.delete(p.num);
+    page.cleanup();
+  }
+}
+
+/* Render a window around the viewport, drop the pixels of everything else.
+   The margin preloads roughly one screen ahead in each direction. */
+const near = new Set();
+const io = new IntersectionObserver(entries => {
+  for (const e of entries) {
+    const num = +e.target.dataset.num;
+    e.isIntersecting ? near.add(num) : near.delete(num);
+  }
+  if (!near.size) return;
+  const lo = Math.min(...near) - KEEP, hi = Math.max(...near) + KEEP;
+  for (const p of pages) {
+    if (p.num >= lo && p.num <= hi) render(p);
+    else if (p.canvas) invalidate(p);
+  }
+}, { rootMargin: '80% 0px' });
+
+/* The page number is geometry, not intersection: whichever page covers the
+   middle of the viewport is the one being read. */
+let ticking = false;
+function updatePageInfo() {
+  if (ticking) return;
+  ticking = true;
+  requestAnimationFrame(() => {
+    ticking = false;
+    if (!pdf) return;
+    // Whichever page shows the most of itself below the toolbar is "the" page.
+    const top = document.getElementById('bar').getBoundingClientRect().bottom;
+    let current = 1, best = -1;
+    for (const p of pages) {
+      const r = p.el.getBoundingClientRect();
+      if (r.bottom < top) continue;
+      if (r.top > innerHeight) break;
+      const seen = Math.min(r.bottom, innerHeight) - Math.max(r.top, top);
+      if (seen > best) { best = seen; current = p.num; }
+    }
+    pageInfo.textContent = `${current} / ${pdf.numPages}`;
+  });
+}
+addEventListener('scroll', updatePageInfo, { passive: true });
+
+function setZoom(z) {
+  zoom = Math.min(4, Math.max(0.5, z));
+  layout();
+  for (const num of near) render(pages[num - 1]);
+}
+document.getElementById('zoomIn').onclick  = () => setZoom(zoom * 1.25);
+document.getElementById('zoomOut').onclick = () => setZoom(zoom / 1.25);
+
+let resizeTimer;
+addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { layout(); for (const n of near) render(pages[n - 1]); }, 200);
+});
+
+(async function main() {
+  try {
+    const task = pdfjsLib.getDocument({ url: FILE, disableAutoFetch: true, disableStream: false });
+    task.onProgress = ({ loaded, total }) => {
+      if (total) fillEl.style.width = Math.min(100, (loaded / total) * 100) + '%';
+    };
+    pdf = await task.promise;
+
+    // One real page gives the aspect ratio used for every placeholder; each page
+    // corrects its own ratio when it actually renders.
+    const first = await pdf.getPage(1);
+    const unit = first.getViewport({ scale: 1 });
+    const ratio = unit.height / unit.width;
+
+    for (let n = 1; n <= pdf.numPages; n++) {
+      const el = document.createElement('div');
+      el.className = 'page';
+      el.dataset.num = n;
+      el.innerHTML = `<div class="num">Page ${n}</div>`;
+      viewer.appendChild(el);
+      pages.push({ num: n, el, ratio, canvas: null, cssWidth: 0 });
+    }
+
+    pageInfo.textContent = `1 / ${pdf.numPages}`;
+    viewer.hidden = false;
+    statusEl.classList.add('hidden');
+    layout();
+    updatePageInfo();
+    pages.forEach(p => io.observe(p.el));
+  } catch (err) {
+    console.error(err);
+    fillEl.parentElement.remove();
+    msgEl.innerHTML =
+      `Couldn't display the document.<br><a href="${FILE}">Open the PDF directly</a>`;
+  }
+})();
+</script>
 </body>
 </html>
